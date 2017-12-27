@@ -63,6 +63,9 @@
 #include "pinmux.h"
 #include "tmp006drv.h"
 
+//Ringbuffer for temperature
+#include "ringbuffer.h"
+
 // required by sprintf
 #include <stdio.h>
 
@@ -106,6 +109,7 @@ volatile unsigned long g_ulStatus = 0;              // SimpleLink Status
 unsigned long g_ulGatewayIP       = 0;              // Network Gateway IP address
 unsigned char g_ucConnectionSSID[SSID_LEN_MAX + 1]; // Connection SSID
 unsigned char g_ucConnectionBSSID[BSSID_LEN_MAX];   // Connection BSSID
+ring_buffer_t g_rbTempBuffer;
 
 #if defined( ccs )
 extern void ( *const g_pfnVectors[] )( void );
@@ -159,7 +163,8 @@ const char* const gButtonSW3TopicName =
 xi_context_handle_t gXivelyContextHandle = -1;
 
 /* Used to store the temperature timed task handles. */
-xi_timed_task_handle_t gTemperatureTaskHandle = -1;
+xi_timed_task_handle_t gMeasureTemperatureTaskHandle = -1;
+xi_timed_task_handle_t gSendTemperatureTaskHandle = -1;
 
 /* Used by onLed handler function to differentiate LED's */
 const static ledNames gGreenLed  = MCU_GREEN_LED_GPIO;
@@ -283,20 +288,13 @@ void onLedTopic( xi_context_handle_t in_context_handle,
 
 /**
  * @brief Recurring time task that temporarily activates the device's temperature sensor,
- * publishes the result on the temperature topic for the device, an then re-enables LED
+ * measures the result on the temperature topic for the device, an then re-enables LED
  * control.
  *
  * @note for more details about user time tasks please refer to the xively.h -
  * xi_schedule_timed_task function.
- *
- * @param context_handle - xively library context required for calling API functions
- * @param timed_task_handle - handle to *this* timed task, can be used to re-schedule or
- * cancel the task
- * @param user_data - data assosicated with this timed task
  */
-void send_temperature( const xi_context_handle_t context_handle,
-                       const xi_timed_task_handle_t timed_task_handle,
-                       void* user_data )
+void measure_temperature()
 {
     /* Prepare configuration for temperature sensor for I2C bus */
     PinTypeI2C( PIN_01, PIN_MODE_1 );
@@ -304,7 +302,6 @@ void send_temperature( const xi_context_handle_t context_handle,
 
     int lRetVal        = -1;
     float fCurrentTemp = .0f;
-    char msg[16]       = {'\0'};
 
     /* I2C Init */
     lRetVal = I2C_IF_Open( I2C_MASTER_MODE_FST );
@@ -324,9 +321,7 @@ void send_temperature( const xi_context_handle_t context_handle,
 
     TMP006DrvGetTemp( &fCurrentTemp );
 
-    sprintf( ( char* )&msg, "%5.02f", fCurrentTemp );
-    xi_publish( context_handle, gTemperatureTopicName, msg, XI_MQTT_QOS_AT_MOST_ONCE,
-                XI_MQTT_RETAIN_FALSE, NULL, NULL );
+    ring_buffer_queue(&g_rbTempBuffer, fCurrentTemp);
 
     do
     {
@@ -339,6 +334,32 @@ end:
 
     PinTypeGPIO( PIN_02, PIN_MODE_0, false );
     GPIODirModeSet( GPIOA1_BASE, 0x8, GPIO_DIR_MODE_OUT );
+}
+
+/**
+ * @brief Recurring time task that temporarily activates the device's temperature sensor,
+ * publishes the result on the temperature topic for the device, an then re-enables LED
+ * control.
+ *
+ * @note for more details about user time tasks please refer to the xively.h -
+ * xi_schedule_timed_task function.
+ *
+ * @param context_handle - xively library context required for calling API functions
+ * @param timed_task_handle - handle to *this* timed task, can be used to re-schedule or
+ * cancel the task
+ * @param user_data - data assosicated with this timed task
+ */
+void send_temperature( const xi_context_handle_t context_handle,
+                       const xi_timed_task_handle_t timed_task_handle,
+                       void* user_data )
+{
+    char msg[16]       = {'\0'};
+
+    if(ring_buffer_is_full(&g_rbTempBuffer)) {
+        sprintf( ( char* )&msg, ",temp,%5.02f,", ring_buffer_get_average(&g_rbTempBuffer));
+        xi_publish( context_handle, gTemperatureTopicName, msg, XI_MQTT_QOS_AT_MOST_ONCE,
+                        XI_MQTT_RETAIN_FALSE, NULL, NULL );
+    }
 }
 
 /**
@@ -370,11 +391,20 @@ void on_connected( xi_context_handle_t in_context_handle, void* data, xi_state_t
         case XI_CONNECTION_STATE_OPENED:
             XIVELY_DEMO_PRINT( "connected to %s:%d\n", conn_data->host, conn_data->port );
 
-            /* register a function to publish temperature data every 5 seconds */
-            gTemperatureTaskHandle =
-                xi_schedule_timed_task( in_context_handle, send_temperature, 5, 1, NULL );
+            /* register a function to measure temperature data every 10 seconds */
+            gMeasureTemperatureTaskHandle =
+                xi_schedule_timed_task( in_context_handle, measure_temperature, 10, 1, NULL );
 
-            if ( XI_INVALID_TIMED_TASK_HANDLE == gTemperatureTaskHandle )
+            if ( XI_INVALID_TIMED_TASK_HANDLE == gMeasureTemperatureTaskHandle )
+            {
+                XIVELY_DEMO_PRINT( "measure_temperature_task couldn't be registered\n" );
+            }
+
+            /* register a function to send temperature data every 30 seconds */
+            gSendTemperatureTaskHandle =
+                xi_schedule_timed_task( in_context_handle, send_temperature, 30, 1, NULL );
+
+            if ( XI_INVALID_TIMED_TASK_HANDLE == gSendTemperatureTaskHandle )
             {
                 XIVELY_DEMO_PRINT( "send_temperature_task couldn't be registered\n" );
             }
@@ -396,8 +426,10 @@ void on_connected( xi_context_handle_t in_context_handle, void* data, xi_state_t
 
             /* cancel timed task - we don't want to send messages while the library not
              * connected */
-            xi_cancel_timed_task( gTemperatureTaskHandle );
-            gTemperatureTaskHandle = XI_INVALID_TIMED_TASK_HANDLE;
+            xi_cancel_timed_task( gSendTemperatureTaskHandle );
+            gSendTemperatureTaskHandle = XI_INVALID_TIMED_TASK_HANDLE;
+            xi_cancel_timed_task( gMeasureTemperatureTaskHandle );
+            gMeasureTemperatureTaskHandle = XI_INVALID_TIMED_TASK_HANDLE;
 
             /* disable button interrupts so the messages for button push/release events
              * won't be sent */
