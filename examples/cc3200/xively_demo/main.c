@@ -77,22 +77,49 @@
     UART_PRINT( __VA_ARGS__ );                                                           \
     printf( __VA_ARGS__ );
 
+/*****************************************************************************
+ *                              Defines
+ *****************************************************************************/
 #define APPLICATION_NAME "XIVELY_CC3200_DEMO_APP"
 #define APPLICATION_VERSION "0.0.1"
 #define SUCCESS 0
 
-// Values for below macros shall be modified per the access-point's (AP) properties.
-// SimpleLink device will connect to following AP when the application is executed.
-#define ENT_NAME "YOUR_WIFI_SSID"
-#define PASSWORD "YOUR_WIFI_PASSWORD"
+#define XIVELY_CRED_LEN_MAX ( 64 )
+#define WIFI_KEY_LEN_MAX ( 64 )
+#define XIVELY_CRED_LEN_MAX ( 64 )
 
-// Values for below macros will be used for connecting the device to Xively's
-// MQTT broker
-#define XIVELY_DEVICE_ID "PASTE_YOUR_XIVELY_DEVICE_ID"
-#define XIVELY_DEVICE_SECRET "PASTE_YOUR_XIVELY_DEVICE_SECRET"
-#define XIVELY_ACCOUNT_ID "PASTE_YOUR_XIVELY_ACCOUNT_ID"
+/* Path to load the configuration file from device's flash file system.
+ * This config file contains Xively connection credentials and WiFi SSID
+ * and password credentials */
+#define XIVELY_CFG_FILE "/etc/xively_cfg.txt"
+
+/* Some defaults for the optional connection address configuration values */
+#define XIVELY_DEFAULT_BROKER "broker.xively.eu"
+#define XIVELY_DEFAULT_PORT ( 8883 )
+
+/* Xively Configuration File Key Names. These will be used to lookup key/value pairs
+ * for Xively credentials and WiFI credentials from a file stored in the device's
+ * flash file system */
+#define WIFI_SEC_TYPE_KEY "wifi_security_type"
+#define WIFI_SSID_KEY "wifi_ssid"
+#define WIFI_PASSWORD_KEY "wifi_password"
+#define XIVELY_HOST_KEY "hostname"
+#define XIVELY_PORT_KEY "port"
+#define XIVELY_ACNT_KEY "account_id"
+#define XIVELY_DEV_KEY "device_id"
+#define XIVELY_PWD_KEY "password"
+
+/* Used to detect if the user has configured their xively_cfg.txt file
+ * on the device before the execution of the application */
+#define XIVELY_DEFAULT_CONFIG_FIELD_VALUE "PASTE_XIVELY_CREDENTIAL_HERE"
+#define WIFI_DEFAULT_CONFIG_FIELD_VALUE "ENTER_WIFI_CREDENTIAL_HERE"
 
 #define ENABLE_XIVELY_FIRMWARE_UPDATE_AND_SECURE_FILE_TRANSFER 1
+
+/* String template for dynamically constructing the various Xively topics
+ * that are used for this application. */
+#define XIVELY_TOPIC_LEN ( 128 )
+#define XIVELY_TOPIC_FORMAT "xi/blue/v1/%s/d/%s/%s"
 
 // Application specific status/error codes
 typedef enum {
@@ -102,6 +129,18 @@ typedef enum {
     STATUS_CODE_MAX            = -0xBB8
 } e_AppStatusCodes;
 
+/* WiFi and Xively Credentials are stored here after being parsed
+ * from configuration file in FFS. */
+typedef struct WifiDeviceCredentials_s
+{
+    int desiredWifiSecurityType;               /* see SL_WLAN_SEC_TYPE in wlan.h */
+    char desiredWifiSSID[SSID_LEN_MAX + 1];    /* user configured host wifi SSID */
+    char desiredWifiKey[WIFI_KEY_LEN_MAX + 1]; /* user configured wifi password */
+    char xivelyAccountId[XIVELY_CRED_LEN_MAX];
+    char xivelyDeviceId[XIVELY_CRED_LEN_MAX];
+    char xivelyDevicePassword[XIVELY_CRED_LEN_MAX];
+} WifiDeviceCredentials_t;
+
 //*****************************************************************************
 //                 GLOBAL VARIABLES -- Start
 //*****************************************************************************
@@ -110,6 +149,10 @@ unsigned long g_ulGatewayIP       = 0;              // Network Gateway IP addres
 unsigned char g_ucConnectionSSID[SSID_LEN_MAX + 1]; // Connection SSID
 unsigned char g_ucConnectionBSSID[BSSID_LEN_MAX];   // Connection BSSID
 ring_buffer_t g_rbTempBuffer;
+
+/* Struct which stores device configuration for desired WiFi connection parameters and
+ * for Xively connection parameters. */
+WifiDeviceCredentials_t g_wifi_device_credentials;
 
 #if defined( ccs )
 extern void ( *const g_pfnVectors[] )( void );
@@ -139,24 +182,19 @@ void WaitForWlanEvent();
 #include <xi_bsp_rng.h>
 #include <xi_bsp_time.h>
 #include <xively.h>
+#include "config_file.h"
 
 /******************************************************************************/
 /* BEGINNING OF XIVELY CODE GLOBAL SECTION */
 /******************************************************************************/
 
 /* Names of the MQTT topics used by this application */
-const char* const gTemperatureTopicName =
-    "xi/blue/v1/" XIVELY_ACCOUNT_ID "/d/" XIVELY_DEVICE_ID "/Temperature";
-const char* const gGreenLedTopicName =
-    "xi/blue/v1/" XIVELY_ACCOUNT_ID "/d/" XIVELY_DEVICE_ID "/Green LED";
-const char* const gOrangeLedTopicName =
-    "xi/blue/v1/" XIVELY_ACCOUNT_ID "/d/" XIVELY_DEVICE_ID "/Orange LED";
-const char* const gRedLedTopicName =
-    "xi/blue/v1/" XIVELY_ACCOUNT_ID "/d/" XIVELY_DEVICE_ID "/Red LED";
-const char* const gButtonSW2TopicName =
-    "xi/blue/v1/" XIVELY_ACCOUNT_ID "/d/" XIVELY_DEVICE_ID "/Button SW2";
-const char* const gButtonSW3TopicName =
-    "xi/blue/v1/" XIVELY_ACCOUNT_ID "/d/" XIVELY_DEVICE_ID "/Button SW3";
+const char* const gTemperatureTopicName = "temp";
+const char* const gGreenLedTopicName = "Green LED";
+const char* const gOrangeLedTopicName = "Orange LED";
+const char* const gRedLedTopicName = "Red LED";
+const char* const gButtonSW2TopicName = "Button SW2";
+const char* const gButtonSW3TopicName = "Button SW3";
 
 /* Required by push button interrupt handlers - there is no space for user argument so we
  * can't pass the xively's context handler as a function argument. */
@@ -175,6 +213,60 @@ const static ledNames gRedLed    = MCU_RED_LED_GPIO;
 /* END OF XIVELY CODE GLOBAL SECTION */
 /******************************************************************************/
 
+/*
+ * @brief Subscribes to a topic given a channel (topic suffix) and a callback.
+ * See xively.h for full signature information of callbacks.
+ *
+ * @param in_context_handle the Xively connection context as was returned from
+ * xi_create_context, and passed in from the connection callback on_connected().
+ * This value must be used in all further Xively operations, including subscription
+ * requests (below.)
+ * @param channel a string to append to the end of the topic base string.  General
+ * topic structure is:  xi/blue/v1/{accountId}/d/{deviceId}/{channel}.
+ * @param callback a pointer to the callback function that handles subscription
+ * status updates and incoming messages on the topic.  For this example application
+ * this is on_blink_topic as specified in the invocation of this function in
+ * on_connected() (above.)
+ * @param user_data an abstract data pointer that can be anything, and will be
+ * passed to the subscription handler on all invocations.  In this case the GPIO
+ * index of the corresponding LED is provided. We use this to easily associate a topic
+ * with an LED, without having to parse the full topic name.
+ * @retval xi_state_t which is the success / failure code of the xi_subscription request.
+ * Since the actual subscription response from the service occurs asynchronously, this
+ * value represents if the subscription request was properly queued by the Xively Client,
+ * and does not reflect the SUBACK value of the subscription request itself.
+ */
+xi_state_t subscribe_to_topic( xi_context_handle_t context_handle,
+                               const char* channel,
+                               xi_user_subscription_callback_t* callback,
+                               void* user_data )
+{
+    char topic_name[XIVELY_TOPIC_LEN];
+    memset( topic_name, '\0', XIVELY_TOPIC_LEN );
+
+    snprintf( topic_name, XIVELY_TOPIC_LEN, XIVELY_TOPIC_FORMAT,
+              g_wifi_device_credentials.xivelyAccountId,
+              g_wifi_device_credentials.xivelyDeviceId, channel );
+
+    return xi_subscribe( context_handle, topic_name, XI_MQTT_QOS_AT_MOST_ONCE, callback,
+                         user_data );
+}
+
+xi_state_t publish_to_topic( xi_context_handle_t context_handle,
+                               const char* channel,
+                               void* msg )
+{
+    char topic_name[XIVELY_TOPIC_LEN];
+    memset( topic_name, '\0', XIVELY_TOPIC_LEN );
+
+    snprintf( topic_name, XIVELY_TOPIC_LEN, XIVELY_TOPIC_FORMAT,
+              g_wifi_device_credentials.xivelyAccountId,
+              g_wifi_device_credentials.xivelyDeviceId, channel );
+
+    return xi_publish( context_handle, topic_name, msg, XI_MQTT_QOS_AT_MOST_ONCE,
+                       XI_MQTT_RETAIN_FALSE, NULL, NULL );
+}
+
 /**
 * @brief Event handler for SW2 button press/release interrupts.
  *
@@ -183,16 +275,13 @@ const static ledNames gRedLed    = MCU_RED_LED_GPIO;
 void pushButtonInterruptHandlerSW2()
 {
     int pinValue = GPIOPinRead( GPIOA2_BASE, GPIO_PIN_6 );
-
     if ( pinValue == 0 )
     {
-        xi_publish( gXivelyContextHandle, gButtonSW2TopicName, "0",
-                    XI_MQTT_QOS_AT_MOST_ONCE, XI_MQTT_RETAIN_FALSE, NULL, NULL );
+        publish_to_topic( gXivelyContextHandle, gButtonSW2TopicName, "0");
     }
     else
     {
-        xi_publish( gXivelyContextHandle, gButtonSW2TopicName, "1",
-                    XI_MQTT_QOS_AT_MOST_ONCE, XI_MQTT_RETAIN_FALSE, NULL, NULL );
+        publish_to_topic( gXivelyContextHandle, gButtonSW2TopicName, "1");
     }
 
     Button_IF_EnableInterrupt( SW2 );
@@ -209,13 +298,11 @@ void pushButtonInterruptHandlerSW3()
 
     if ( pinValue == 0 )
     {
-        xi_publish( gXivelyContextHandle, gButtonSW3TopicName, "0",
-                    XI_MQTT_QOS_AT_MOST_ONCE, XI_MQTT_RETAIN_FALSE, NULL, NULL );
+        publish_to_topic( gXivelyContextHandle, gButtonSW3TopicName, "0");
     }
     else
     {
-        xi_publish( gXivelyContextHandle, gButtonSW3TopicName, "1",
-                    XI_MQTT_QOS_AT_MOST_ONCE, XI_MQTT_RETAIN_FALSE, NULL, NULL );
+        publish_to_topic( gXivelyContextHandle, gButtonSW3TopicName, "1");
     }
 
     Button_IF_EnableInterrupt( SW3 );
@@ -357,8 +444,7 @@ void send_temperature( const xi_context_handle_t context_handle,
 
     if(ring_buffer_is_full(&g_rbTempBuffer)) {
         sprintf( ( char* )&msg, ",temp,%5.02f,", ring_buffer_get_average(&g_rbTempBuffer));
-        xi_publish( context_handle, gTemperatureTopicName, msg, XI_MQTT_QOS_AT_MOST_ONCE,
-                        XI_MQTT_RETAIN_FALSE, NULL, NULL );
+        publish_to_topic(context_handle, gTemperatureTopicName, msg);
     }
 }
 
@@ -410,12 +496,9 @@ void on_connected( xi_context_handle_t in_context_handle, void* data, xi_state_t
             }
 
             /* subscribe to LED topics to listen for light toggle commands */
-            xi_subscribe( in_context_handle, gGreenLedTopicName, XI_MQTT_QOS_AT_MOST_ONCE,
-                          onLedTopic, ( void* )&gGreenLed );
-            xi_subscribe( in_context_handle, gOrangeLedTopicName,
-                          XI_MQTT_QOS_AT_MOST_ONCE, onLedTopic, ( void* )&gOrangeLed );
-            xi_subscribe( in_context_handle, gRedLedTopicName, XI_MQTT_QOS_AT_MOST_ONCE,
-                          onLedTopic, ( void* )&gRedLed );
+            subscribe_to_topic( in_context_handle, gGreenLedTopicName, onLedTopic, ( void* )&gGreenLed );
+            subscribe_to_topic( in_context_handle, gOrangeLedTopicName, onLedTopic, ( void* )&gOrangeLed );
+            subscribe_to_topic( in_context_handle, gRedLedTopicName, onLedTopic, ( void* )&gRedLed );
 
             /* enable the button interrupts */
             Button_IF_EnableInterrupt( SW2 | SW3 );
@@ -476,7 +559,8 @@ void ConnectToXively()
     /* Disable the interrupt for now */
     Button_IF_DisableInterrupt( SW2 | SW3 );
 
-    xi_state_t ret_state = xi_initialize( XIVELY_ACCOUNT_ID, XIVELY_DEVICE_ID );
+    xi_state_t ret_state = xi_initialize( g_wifi_device_credentials.xivelyAccountId,
+                                          g_wifi_device_credentials.xivelyDeviceId );
 
     if ( XI_STATE_OK != ret_state )
     {
@@ -502,8 +586,9 @@ void ConnectToXively()
 #endif
 
     xi_state_t connect_result =
-        xi_connect( gXivelyContextHandle, XIVELY_DEVICE_ID, XIVELY_DEVICE_SECRET, 10, 0,
-                    XI_SESSION_CLEAN, &on_connected );
+            xi_connect( gXivelyContextHandle, g_wifi_device_credentials.xivelyDeviceId,
+                        g_wifi_device_credentials.xivelyDevicePassword, 10, 0,
+                        XI_SESSION_CLEAN, &on_connected );
 
     /* start processing xively library events */
     xi_events_process_blocking();
@@ -529,6 +614,322 @@ time_t XTIME( time_t* timer )
 uint32_t xively_ssl_rand_generate()
 {
     return xi_bsp_rng_get();
+}
+
+/* @brief helper function that uses the config_file parser to parse a value for the
+ * provided key.
+ *
+ * @param config_file_context this value returned from the creation of the config_file
+ * parser.
+ * This context is required for all config_file operations.
+ * @param key a string to use as a lookup key for the key/value pairs in the config file.
+ * @param is_required when set to a non-zero value, an error will be logged to the console
+ * if the
+ * specified key could not be found in the configuration file.  This does not effect the
+ * return value
+ * of this function.
+ * @retval 0 on successful parse of parameter. -1 if parameter does not exist in the
+ * configuration file,
+ * or if another error has occurred.
+ */
+int8_t parseKeyValue( config_entry_t* config_file_context,
+                      const char* key,
+                      const uint8_t is_required,
+                      char** out_value )
+{
+    int8_t retVal = 0;
+    if ( NULL == out_value )
+    {
+        printf( "parseRequiredKeyValue error: out_value parameter is NULL!\n\r" );
+        retVal = -1;
+    }
+    else if ( NULL == key )
+    {
+        printf( "parseRequiredKeyValue error: in_key parameter is NULL!\n\r" );
+        retVal = -1;
+    }
+    else
+    {
+        *out_value = get_config_value( config_file_context, key );
+        if ( NULL == *out_value )
+        {
+            retVal = -1;
+            if ( is_required )
+            {
+                printf( "Could not find an entry for \"%s\" key in configuration file\n",
+                        key );
+            }
+        }
+    }
+
+    return retVal;
+}
+
+/* @brief Attempts to match the string from the configuration file to an enumeration
+ * the platform's SDK wlan.h file.  The most common LAN types are supported
+ * out of the box. The more uncommong lans haven't been tested again
+ * but in theory could be enabled.
+ * @retval one of the SL_WLAN_SEC_TYPE values as defined in wlan.h, or
+ * -1 if the mapping failed.
+ */
+int8_t mapWifiSecurityTypeStringToInt( const char* security_type )
+{
+    if ( NULL == security_type )
+    {
+        printf( "Now Wifi Security Type String found in configuration file!\n\r" );
+        return -1;
+    }
+
+    if ( strcmp( "open", security_type ) == 0 || strcmp( "OPEN", security_type ) == 0 )
+    {
+        return SL_SEC_TYPE_OPEN;
+    }
+
+    if ( strcmp( "wep", security_type ) == 0 || strcmp( "WEP", security_type ) == 0 )
+    {
+        return SL_SEC_TYPE_WEP;
+    }
+
+    if ( strcmp( "wpa", security_type ) == 0 || strcmp( "WPA", security_type ) == 0 )
+    {
+        return SL_SEC_TYPE_WPA;
+    }
+
+    if ( strcmp( "wpa2", security_type ) == 0 || strcmp( "WPA2", security_type ) == 0 )
+    {
+        return SL_SEC_TYPE_WPA_WPA2;
+    }
+
+    if ( strcmp( "wpa_ent", security_type ) == 0 ||
+         strcmp( "WPA_ENT", security_type ) == 0 )
+    {
+        return SL_SEC_TYPE_WPA_ENT;
+    }
+
+    /* potential future support based on CC3220 SDK:
+     *
+     * SL_SEC_TYPE_WPS_PBC
+     * SL_SEC_TYPE_WPS_PIN
+     * SL_SEC_TYPE_P2P_PBC
+     * SL_SEC_TYPE_P2P_PIN_KEYPAD
+     * SL_SEC_TYPE_P2P_PIN_DISPLAY
+     * SL_SEC_TYPE_P2P_PIN_AUTO
+     */
+    printf( "Unsupported Wifi security type: \"%s\"\n\r", security_type );
+    return -1;
+}
+
+/* @brief helper function. checks to if wifi credentials are of the right size
+ * and type to match simplielink API
+ *
+ * @param wifi_ssid The wifi network name.
+ * @param wifi_ssid The wifi password
+ * @param wifi_ssid a string that represents the suffix of one of the valid
+ * simplelink enumerated types. For instance "wpa" would be mapped to
+ * SL_WLAN_SEC_TYPE_WPA.  This check is done in mapWifiSecurityTypeStringToInt().
+ * @retval 0 if parameters are valid, -1 otherwise.
+ */
+int8_t validateWifiConfigurationVariables( const char* wifi_ssid,
+                                           const char* wifi_password,
+                                           const char* wifi_security_type )
+{
+    int8_t retVal = 0;
+
+    /* SSID / wifi name checks */
+    if ( strlen( wifi_ssid ) > SSID_LEN_MAX )
+    {
+        retVal = -1;
+        printf( ". \"%s\" string is too long for CC3220 wifi configuration: \"%s\"\n\r",
+                WIFI_SSID_KEY, wifi_ssid );
+        printf( ". Max String Length is: %d\n\r", SSID_LEN_MAX );
+    }
+
+    /* wifi password checks */
+    if ( strlen( wifi_password ) > WIFI_KEY_LEN_MAX )
+    {
+        retVal = -1;
+        printf( ". Value for \"%s\" string is too big: \"%s\"\n\r", WIFI_SSID_KEY,
+                wifi_password );
+        printf( ". Please reconfigure WIFI_KEY_LEN_MAX in xively_example.h to increase "
+                "the buffer size\n\r" );
+        printf( ". Max String Length is: %d\n\r", WIFI_KEY_LEN_MAX );
+    }
+
+    /* Security type enum checks */
+    int8_t wifi_security_type_enum =
+        mapWifiSecurityTypeStringToInt( ( const char* )wifi_security_type );
+    if ( wifi_security_type < 0 )
+    {
+        retVal = -1;
+        printf( ". Could not find valid \"%s\" ", WIFI_SEC_TYPE_KEY );
+        printf( " in xively configuration file \"%s\"\n\r", XIVELY_CFG_FILE );
+    }
+
+    if ( 0 == strcmp( wifi_ssid, WIFI_DEFAULT_CONFIG_FIELD_VALUE ) )
+    {
+        retVal = -1;
+        printf( ". Default WiFi SSID field entry found.\n\r" );
+        printf( "   Did you forget to edit the configuration file \"%s\"?\n\r",
+                XIVELY_CFG_FILE );
+    }
+
+    if ( 0 == strcmp( wifi_password, WIFI_DEFAULT_CONFIG_FIELD_VALUE ) )
+    {
+        retVal = -1;
+        printf( ". Default WiFi Password field entry found.\n\r" );
+        printf( "   Did you forget to edit the configuration file \"%s\"?\n\r",
+                XIVELY_CFG_FILE );
+    }
+
+    return retVal;
+}
+
+/* @brief helper function. checks to if key's value string will fit into our Application
+ * Control Block
+ *
+ * @param config_key the key string that was used to lookup the value in the config file.
+ * This is only used for logging purposes.
+ * @param value the value string that will be stored as a Xively Credential.  This
+ * function
+ * checks to make sure that the value will fit in the Application Control Blocks buffers
+ * for Xively Credentials before a copy is made.
+ * @retval 0 if the credentials are of a valid size, -1 otherwise.
+ * */
+int8_t validateXivelyCredentialBufferRequirement( const char* const config_key,
+                                                  const char* value )
+{
+    if ( NULL == value )
+    {
+        printf( ". Key \"%s\" is missing a value in the configuration file: \"%s\"\n\r",
+                config_key, value );
+        return -1;
+    }
+
+    if ( 0 == strcmp( value, XIVELY_DEFAULT_CONFIG_FIELD_VALUE ) )
+    {
+        printf( ". \"%s\" value's is still the default value.\n\r", config_key );
+        printf( "   Did you forget to edit the configuration file \"%s\"?\n\r",
+                XIVELY_CFG_FILE );
+        return -1;
+    }
+
+    if ( strlen( value ) > XIVELY_CRED_LEN_MAX )
+    {
+        printf( ". \"%s\" value's string is too long for internal buffer configuration. "
+                "value is: \"%s\"\n\r",
+                config_key, value );
+        printf( ". Max String Length is: %d\n\r", XIVELY_CRED_LEN_MAX );
+        return -1;
+    }
+
+    return 0;
+}
+
+/* @brief Retrieves Wifi Credential and Xively Credential information from a configuration
+ * file stored on the Flash File System of the device.
+ *
+ * Invokes the configuration file parser in config_file.h / config_file.c for file
+ * operations and for parsing the key value pairs.
+ *
+ * Ensures that all required credentials exist in the file and that they fit into the
+ * Application control block buffers.  Additionally the wifi security
+ * type is mapped to an existing CC3220 Simple Link Enumeration.
+ *
+ * If any validation fails then this function logs an error to the console
+ * and loops forever, since any configuration error will prevent the application
+ * from connecting to wifi and/or the xively service.
+ */
+void parseCredentialsFromConfigFile()
+{
+    config_entry_t* config_file_context;
+    int err = read_config_file( XIVELY_CFG_FILE, &config_file_context );
+    if ( err )
+    {
+        printf( ". Reading %s config file failed. returned %d\n\r", XIVELY_CFG_FILE,
+                err );
+        if ( SL_FS_ERR_FILE_NOT_EXISTS == err )
+        {
+            Report( ". File does not exist on flash file system.\n\r" );
+        }
+        Report( ". Cannot recover from error.\n\r" );
+        Report( ". Looping forever.\n\r" );
+        while ( 1 )
+            ;
+    }
+
+    /* parse wifi credentials from config file */
+    static char *wifi_ssid = NULL, *wifi_security_type = NULL, *wifi_password = NULL;
+
+    err |= parseKeyValue( config_file_context, WIFI_SSID_KEY, 1, &wifi_ssid );
+    err |=
+        parseKeyValue( config_file_context, WIFI_SEC_TYPE_KEY, 1, &wifi_security_type );
+    err |= parseKeyValue( config_file_context, WIFI_PASSWORD_KEY, 1, &wifi_password );
+
+    /* parse Xively account & device credentials from config file */
+    static char *xively_account_id = NULL, *xively_device_id = NULL,
+                *xively_device_password = NULL;
+    err |= parseKeyValue( config_file_context, XIVELY_ACNT_KEY, 1, &xively_account_id );
+    err |= parseKeyValue( config_file_context, XIVELY_DEV_KEY, 1, &xively_device_id );
+    err |=
+        parseKeyValue( config_file_context, XIVELY_PWD_KEY, 1, &xively_device_password );
+
+    /* optional - parse xively broker address and port from config file */
+    static char *broker_name = NULL, *broker_port_str = NULL;
+    if ( 0 != parseKeyValue( config_file_context, XIVELY_HOST_KEY, 0, &broker_name ) )
+    {
+        broker_name = XIVELY_DEFAULT_BROKER;
+    }
+
+    if ( 0 == parseKeyValue( config_file_context, XIVELY_PORT_KEY, 0, &broker_port_str ) )
+    {
+        if ( 0 == ( atoi( broker_port_str ) ) )
+        {
+            printf( ". \"%s\" value \"%s\" is an invalid \"port\" value\n",
+                    XIVELY_PORT_KEY, broker_port_str );
+            err = -1;
+        }
+    }
+
+    /* if everything is ok so far then do some sanity checks on the string sizes and the
+     * parsed values. */
+    if ( !err )
+    {
+        err |= validateWifiConfigurationVariables( wifi_ssid, wifi_password,
+                                                   wifi_security_type );
+
+        err |= validateXivelyCredentialBufferRequirement( XIVELY_ACNT_KEY,
+                                                          xively_account_id );
+        err |=
+            validateXivelyCredentialBufferRequirement( XIVELY_DEV_KEY, xively_device_id );
+        err |= validateXivelyCredentialBufferRequirement( XIVELY_PWD_KEY,
+                                                          xively_device_password );
+    }
+
+    /* one last check before we start copying memory around */
+    if ( err )
+    {
+        printf( "\n\rCritical configuration error(s) found when parsing configuration "
+                "file\n\r" );
+        printf( "Looping forever.\n\r" );
+        while ( 1 )
+            ;
+    }
+
+    /* assign the variables into the Application Control Block. */
+    g_wifi_device_credentials.desiredWifiSecurityType =
+        mapWifiSecurityTypeStringToInt( ( const char* )wifi_security_type );
+
+    memcpy( g_wifi_device_credentials.desiredWifiSSID, wifi_ssid, strlen( wifi_ssid ) );
+    memcpy( g_wifi_device_credentials.desiredWifiKey, wifi_password,
+            strlen( wifi_password ) );
+    memcpy( g_wifi_device_credentials.xivelyAccountId, xively_account_id,
+            strlen( xively_account_id ) );
+    memcpy( g_wifi_device_credentials.xivelyDeviceId, xively_device_id,
+            strlen( xively_device_id ) );
+    memcpy( g_wifi_device_credentials.xivelyDevicePassword, xively_device_password,
+            strlen( xively_device_password ) );
+
+    free_config_entries( config_file_context );
 }
 
 /******************************************************************************/
@@ -933,19 +1334,23 @@ long MainLogic()
         return lRetVal;
     }
 
-    XIVELY_DEMO_PRINT( "Device started as STATION \n" );
+    memset( &g_wifi_device_credentials, 0, sizeof( g_wifi_device_credentials ) );
+    parseCredentialsFromConfigFile();
 
     // start ent wlan connection
-    g_SecParams.Key    = PASSWORD;
-    g_SecParams.KeyLen = strlen( ( const char* )g_SecParams.Key );
-    g_SecParams.Type   = SL_SEC_TYPE_WPA_WPA2;
+    g_SecParams.Key = ( _i8* )g_wifi_device_credentials.desiredWifiKey;
+    g_SecParams.KeyLen =
+        strlen( ( const char* )g_wifi_device_credentials.desiredWifiKey );
+    g_SecParams.Type = g_wifi_device_credentials.desiredWifiSecurityType;
 
     // 0 - Disable the server authnetication | 1 - Enable (this is the deafult)
     pValues = 0;
     sl_WlanSet( SL_WLAN_CFG_GENERAL_PARAM_ID, 19, 1, &pValues );
 
     // add the wlan profile
-    sl_WlanProfileAdd( ENT_NAME, strlen( ENT_NAME ), 0, &g_SecParams, 0, 1, 0 );
+    sl_WlanProfileAdd( ( _i8* )g_wifi_device_credentials.desiredWifiSSID,
+                           strlen( g_wifi_device_credentials.desiredWifiSSID ), 0,
+                           &g_SecParams, 0, 1, 0 );
 
     // set the connection policy to auto
     pValues = 0;
